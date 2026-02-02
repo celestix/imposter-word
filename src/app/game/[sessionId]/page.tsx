@@ -15,10 +15,16 @@ type Verdict = {
 type Session = {
   id: string;
   players: Player[];
-  phase: "lobby" | "playing" | "verdict";
+  phase: "lobby" | "playing" | "verdict" | "ended";
   currentRound: number;
   votes: Record<string, string>;
   verdict: Verdict | null;
+  settings: {
+    voteDelayMs: number;
+  };
+  roundStartedAt: number | null;
+  kickVotes: Record<string, string[]>;
+  endGameVotes: string[];
 };
 
 const POLL_MS = 2000;
@@ -40,6 +46,10 @@ export default function GamePage() {
   const [starting, setStarting] = useState(false);
   const [nextRoundLoading, setNextRoundLoading] = useState(false);
   const [error, setError] = useState("");
+  const [canVote, setCanVote] = useState(true);
+  const [voteCountdown, setVoteCountdown] = useState<number | null>(null);
+  const [kickLoadingId, setKickLoadingId] = useState<string | null>(null);
+  const [ending, setEnding] = useState(false);
 
   const storageKey = sessionId ? `imposter-player-${sessionId}` : "";
   const nameKey = sessionId ? `${storageKey}-name` : "";
@@ -98,6 +108,38 @@ export default function GamePage() {
       setWord(null);
     }
   }, [session?.phase, sessionId, playerId, fetchWord]);
+
+  // Vote start timer countdown
+  useEffect(() => {
+    if (!session || session.phase !== "playing") {
+      setCanVote(true);
+      setVoteCountdown(null);
+      return;
+    }
+    const delay = session.settings?.voteDelayMs ?? 0;
+    if (!delay || !session.roundStartedAt) {
+      setCanVote(true);
+      setVoteCountdown(null);
+      return;
+    }
+
+    const update = () => {
+      const now = Date.now();
+      const elapsed = now - (session.roundStartedAt ?? 0);
+      const remainingMs = delay - elapsed;
+      if (remainingMs <= 0) {
+        setCanVote(true);
+        setVoteCountdown(0);
+      } else {
+        setCanVote(false);
+        setVoteCountdown(Math.ceil(remainingMs / 1000));
+      }
+    };
+
+    update();
+    const t = setInterval(update, 500);
+    return () => clearInterval(t);
+  }, [session]);
 
   async function handleHostJoin() {
     setError("");
@@ -191,6 +233,7 @@ export default function GamePage() {
     ? session?.players.find((p) => p.id === votedForId)?.name
     : null;
   const verdict = session?.verdict;
+  const votesNeeded50 = session ? Math.ceil(session.players.length * 0.5) : 0;
 
   if (!sessionId) {
     return (
@@ -260,7 +303,7 @@ export default function GamePage() {
 
   const inLobby = session.phase === "lobby";
   const playing = session.phase === "playing";
-  const showVerdict = session.phase === "verdict";
+  const showVerdict = session.phase === "verdict" || session.phase === "ended";
 
   return (
     <main className="min-h-screen p-6 bg-[var(--bg)]">
@@ -324,18 +367,27 @@ export default function GamePage() {
 
             <div className="rounded-xl bg-[var(--card)] p-6 border border-[var(--muted)]">
               <p className="text-[var(--muted)] text-sm mb-3">Vote for who you think is the imposter</p>
+              {voteCountdown !== null && !canVote && (
+                <p className="text-[var(--muted)] text-xs mb-2">
+                  Voting opens in {voteCountdown}s…
+                </p>
+              )}
               <div className="space-y-2">
                 {otherPlayers.map((p) => (
                   <button
                     key={p.id}
                     type="button"
                     onClick={() => setSelectedVote(p.id)}
-                    disabled={hasVoted}
+                    disabled={hasVoted || !canVote}
                     className={`w-full px-4 py-3 rounded-lg text-left font-medium transition ${
                       selectedVote === p.id
                         ? "bg-[var(--accent)] text-white"
                         : "bg-[var(--bg)] text-white border border-[var(--muted)] hover:border-[var(--accent)]"
-                    } ${hasVoted ? "opacity-70 cursor-default" : ""}`}
+                    } ${
+                      hasVoted || !canVote
+                        ? "opacity-70 cursor-default"
+                        : ""
+                    }`}
                   >
                     {p.name}
                   </button>
@@ -345,7 +397,7 @@ export default function GamePage() {
                 <button
                   type="button"
                   onClick={handleVote}
-                  disabled={voting}
+                  disabled={voting || !canVote}
                   className="mt-4 w-full px-4 py-3 rounded-lg bg-[var(--accent)] text-white font-semibold disabled:opacity-50"
                 >
                   {voting ? "Submitting…" : "Submit vote"}
@@ -357,6 +409,86 @@ export default function GamePage() {
                 </p>
               )}
             </div>
+
+            {/* Votekick during active game */}
+            {session.players.length > 2 && (
+              <div className="rounded-xl bg-[var(--card)] p-6 border border-[var(--muted)] space-y-2">
+                <p className="text-[var(--muted)] text-sm">
+                  Votekick (needs {votesNeeded50} votes)
+                </p>
+                <ul className="space-y-1">
+                  {session.players.map((p) => (
+                    <li key={p.id} className="flex items-center gap-2 text-white text-sm">
+                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />
+                      {p.name}
+                      {p.id === playerId && (
+                        <span className="text-[10px] text-[var(--muted)]">
+                          (you)
+                        </span>
+                      )}
+                      {p.id !== playerId && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setError("");
+                            setKickLoadingId(p.id);
+                            try {
+                              const res = await fetch(
+                                `/api/session/${sessionId}/votekick`,
+                                {
+                                  method: "POST",
+                                  headers: {
+                                    "Content-Type": "application/json",
+                                  },
+                                  body: JSON.stringify({
+                                    playerId,
+                                    targetId: p.id,
+                                  }),
+                                }
+                              );
+                              const data = await res.json().catch(() => ({}));
+                              if (!res.ok) {
+                                throw new Error(
+                                  data.error || "Could not submit kick vote"
+                                );
+                              }
+                              await fetchSession();
+                            } catch (e) {
+                              setError(
+                                e instanceof Error
+                                  ? e.message
+                                  : "Something went wrong"
+                              );
+                            } finally {
+                              setKickLoadingId(null);
+                            }
+                          }}
+                          disabled={
+                            kickLoadingId === p.id ||
+                            !!session.kickVotes[p.id]?.includes(
+                              playerId ?? ""
+                            )
+                          }
+                          className="ml-auto text-[10px] px-2 py-1 rounded bg-[var(--danger)]/20 text-[var(--danger)] hover:bg-[var(--danger)]/30 disabled:opacity-60"
+                        >
+                          {session.kickVotes[p.id]?.includes(playerId ?? "")
+                            ? "Voted"
+                            : kickLoadingId === p.id
+                            ? "Voting…"
+                            : "Votekick"}
+                        </button>
+                      )}
+                      {session.kickVotes[p.id] &&
+                        session.kickVotes[p.id].length > 0 && (
+                          <span className="ml-2 text-[var(--muted)] text-[10px]">
+                            {session.kickVotes[p.id].length}/{votesNeeded50}
+                          </span>
+                        )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </>
         )}
 
@@ -400,14 +532,63 @@ export default function GamePage() {
                 ))}
               </ul>
             </div>
-            <button
-              type="button"
-              onClick={handleNextRound}
-              disabled={nextRoundLoading}
-              className="w-full px-4 py-3 rounded-lg bg-[var(--accent)] text-white font-semibold disabled:opacity-50"
-            >
-              {nextRoundLoading ? "Starting…" : "Next round"}
-            </button>
+            {session.phase !== "ended" && (
+              <div className="space-y-3">
+                <button
+                  type="button"
+                  onClick={handleNextRound}
+                  disabled={nextRoundLoading}
+                  className="w-full px-4 py-3 rounded-lg bg-[var(--accent)] text-white font-semibold disabled:opacity-50"
+                >
+                  {nextRoundLoading ? "Starting…" : "Next round"}
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setError("");
+                    setEnding(true);
+                    try {
+                      const res = await fetch(
+                        `/api/session/${sessionId}/end-game`,
+                        {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ playerId }),
+                        }
+                      );
+                      const data = await res.json().catch(() => ({}));
+                      if (!res.ok) {
+                        throw new Error(
+                          data.error || "Failed to vote to end game"
+                        );
+                      }
+                      await fetchSession();
+                    } catch (e) {
+                      setError(
+                        e instanceof Error
+                          ? e.message
+                          : "Something went wrong"
+                      );
+                    } finally {
+                      setEnding(false);
+                    }
+                  }}
+                  disabled={ending}
+                  className="w-full px-4 py-3 rounded-lg bg-[var(--danger)]/20 text-[var(--danger)] font-semibold disabled:opacity-50"
+                >
+                  {ending ? "Voting…" : "Vote to end game"}
+                </button>
+                <p className="text-[var(--muted)] text-xs text-center">
+                  {session.endGameVotes.length}/{votesNeeded50} players have
+                  voted to end the game.
+                </p>
+              </div>
+            )}
+            {session.phase === "ended" && (
+              <p className="text-[var(--muted)] text-sm text-center">
+                Game ended by group vote.
+              </p>
+            )}
           </div>
         )}
 

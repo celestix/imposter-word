@@ -1,6 +1,6 @@
 import { getRandomWord } from "./words";
 
-export type GamePhase = "lobby" | "playing" | "verdict";
+export type GamePhase = "lobby" | "playing" | "verdict" | "ended";
 
 export type Player = {
   id: string;
@@ -18,6 +18,15 @@ export type Session = {
   votes: Record<string, string>; // playerId -> votedForPlayerId
   verdict: Verdict | null;
   createdAt: number;
+  settings: {
+    // delay before voting is allowed, in ms
+    voteDelayMs: number;
+  };
+  roundStartedAt: number | null;
+  // votekick: targetId -> list of voterIds
+  kickVotes: Record<string, string[]>;
+  // end game: list of playerIds who voted to end
+  endGameVotes: string[];
 };
 
 export type Verdict = {
@@ -53,6 +62,12 @@ export function createSession(): Session {
     votes: {},
     verdict: null,
     createdAt: Date.now(),
+    settings: {
+      voteDelayMs: 0,
+    },
+    roundStartedAt: null,
+    kickVotes: {},
+    endGameVotes: [],
   };
   sessions.set(id, session);
   return session;
@@ -65,9 +80,18 @@ export function getSession(sessionId: string): Session | undefined {
 export function joinSession(sessionId: string, name: string): Player | null {
   const session = sessions.get(sessionId);
   if (!session || session.phase !== "lobby") return null;
+  const trimmed = name.trim();
+  if (
+    !trimmed ||
+    session.players.some(
+      (p) => p.name.trim().toLowerCase() === trimmed.toLowerCase()
+    )
+  ) {
+    return null;
+  }
   const player: Player = {
     id: generateId(),
-    name: name.trim() || `Player ${session.players.length + 1}`,
+    name: trimmed,
     score: 0,
   };
   session.players.push(player);
@@ -77,10 +101,14 @@ export function joinSession(sessionId: string, name: string): Player | null {
 export function startGame(sessionId: string): boolean {
   const session = sessions.get(sessionId);
   if (!session || session.players.length < 2) return false;
+  if (session.phase === "ended") return false;
   session.phase = "playing";
   session.currentRound += 1;
   session.votes = {};
   session.verdict = null;
+  session.kickVotes = {};
+  session.endGameVotes = [];
+  session.roundStartedAt = Date.now();
   const imposterIndex = Math.floor(Math.random() * session.players.length);
   session.imposterId = session.players[imposterIndex].id;
   session.currentWord = getRandomWord();
@@ -94,9 +122,18 @@ export function getWordForPlayer(sessionId: string, playerId: string): string {
   return session.currentWord;
 }
 
+function canVoteNow(session: Session): boolean {
+  const delay = session.settings?.voteDelayMs ?? 0;
+  if (!delay) return true;
+  if (!session.roundStartedAt) return true;
+  const elapsed = Date.now() - session.roundStartedAt;
+  return elapsed >= delay;
+}
+
 export function submitVote(sessionId: string, voterId: string, votedForId: string): boolean {
   const session = sessions.get(sessionId);
   if (!session || session.phase !== "playing") return false;
+  if (!canVoteNow(session)) return false;
   const voter = session.players.find((p) => p.id === voterId);
   const target = session.players.find((p) => p.id === votedForId);
   if (!voter || !target) return false;
@@ -156,6 +193,9 @@ export function nextRound(sessionId: string): boolean {
   session.currentRound += 1;
   session.votes = {};
   session.verdict = null;
+  session.kickVotes = {};
+  session.endGameVotes = [];
+  session.roundStartedAt = Date.now();
   const imposterIndex = Math.floor(Math.random() * session.players.length);
   session.imposterId = session.players[imposterIndex].id;
   session.currentWord = getRandomWord();
@@ -171,4 +211,73 @@ export function allVoted(sessionId: string): boolean {
   const session = sessions.get(sessionId);
   if (!session) return false;
   return Object.keys(session.votes).length === session.players.length;
+}
+
+// --- Votekick ---
+
+function votesNeeded50Percent(totalPlayers: number): number {
+  if (totalPlayers <= 0) return Infinity;
+  // 50% or more of current players
+  return Math.ceil(totalPlayers * 0.5);
+}
+
+export function submitKickVote(
+  sessionId: string,
+  voterId: string,
+  targetId: string
+): boolean {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  // Allow votekick only after the game has started; block in lobby and after end
+  if (session.phase === "lobby" || session.phase === "ended") return false;
+  if (voterId === targetId) return false;
+  const voter = session.players.find((p) => p.id === voterId);
+  const target = session.players.find((p) => p.id === targetId);
+  if (!voter || !target) return false;
+
+  const votersForTarget = session.kickVotes[targetId] ?? [];
+  if (!votersForTarget.includes(voterId)) {
+    votersForTarget.push(voterId);
+    session.kickVotes[targetId] = votersForTarget;
+  }
+
+  const needed = votesNeeded50Percent(session.players.length);
+  if (votersForTarget.length >= needed) {
+    // Kick the target
+    session.players = session.players.filter((p) => p.id !== targetId);
+    // Clean up votes involving the kicked player
+    delete session.kickVotes[targetId];
+    // Remove their regular votes and votes for them
+    for (const [pid, votedFor] of Object.entries(session.votes)) {
+      if (pid === targetId || votedFor === targetId) {
+        delete session.votes[pid];
+      }
+    }
+    // If we kicked the imposter, clear imposterId and end further rounds (treat as ended lobby)
+    if (session.imposterId === targetId) {
+      session.imposterId = null;
+    }
+  }
+  return true;
+}
+
+// --- End game voting ---
+
+export function submitEndGameVote(sessionId: string, voterId: string): boolean {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  if (session.phase !== "verdict" || session.phase === "ended") return false;
+
+  const voter = session.players.find((p) => p.id === voterId);
+  if (!voter) return false;
+
+  if (!session.endGameVotes.includes(voterId)) {
+    session.endGameVotes.push(voterId);
+  }
+
+  const needed = votesNeeded50Percent(session.players.length);
+  if (session.endGameVotes.length >= needed) {
+    session.phase = "ended";
+  }
+  return true;
 }

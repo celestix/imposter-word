@@ -7,6 +7,7 @@ export default function HomePage() {
   const router = useRouter();
   const [mode, setMode] = useState<"choose" | "create" | "join">("choose");
   const [createName, setCreateName] = useState("");
+  const [createVoteDelay, setCreateVoteDelay] = useState("0");
   const [joinSessionId, setJoinSessionId] = useState("");
   const [joinName, setJoinName] = useState("");
   const [loading, setLoading] = useState(false);
@@ -19,7 +20,10 @@ export default function HomePage() {
       const res = await fetch("/api/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: createName || undefined }),
+        body: JSON.stringify({
+          name: createName || undefined,
+          voteDelaySeconds: Number(createVoteDelay) || 0,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to create session");
@@ -110,6 +114,19 @@ export default function HomePage() {
             onChange={(e) => setCreateName(e.target.value)}
             className="w-full px-4 py-3 rounded-lg bg-[var(--card)] border border-[var(--muted)] text-white placeholder:text-[var(--muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
           />
+          <div className="space-y-1 text-left">
+            <label className="block text-xs text-[var(--muted)]">
+              Seconds before voting opens (0 = immediately)
+            </label>
+            <input
+              type="number"
+              min={0}
+              max={300}
+              value={createVoteDelay}
+              onChange={(e) => setCreateVoteDelay(e.target.value)}
+              className="w-full px-4 py-2 rounded-lg bg-[var(--card)] border border-[var(--muted)] text-white placeholder:text-[var(--muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+            />
+          </div>
           <div className="flex gap-2">
             <button
               type="button"

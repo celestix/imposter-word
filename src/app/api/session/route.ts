@@ -5,6 +5,17 @@ export async function POST(request: Request) {
   const session = createSession();
   const body = await request.json().catch(() => ({}));
   const name = typeof body.name === "string" ? body.name.trim() : "";
+  const rawDelay = body.voteDelaySeconds;
+  const delaySeconds =
+    typeof rawDelay === "number"
+      ? rawDelay
+      : typeof rawDelay === "string"
+      ? Number(rawDelay)
+      : 0;
+  if (Number.isFinite(delaySeconds) && delaySeconds >= 0) {
+    session.settings.voteDelayMs = Math.round(delaySeconds * 1000);
+  }
+
   let player = null;
   if (name) {
     player = joinSession(session.id, name);

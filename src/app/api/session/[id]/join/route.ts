@@ -11,7 +11,10 @@ export async function POST(
   const player = joinSession(id, name);
   if (!player) {
     return NextResponse.json(
-      { error: "Could not join session (not in lobby or invalid id)" },
+      {
+        error:
+          "Could not join session (name may already be taken, game not in lobby, or invalid id)",
+      },
       { status: 400 }
     );
   }
